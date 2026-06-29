@@ -1,0 +1,5 @@
+PyInstaller==6.10.0
+sounddevice==0.4.7
+soundfile==0.12.1
+numpy==1.26.4
+vosk==0.3.45

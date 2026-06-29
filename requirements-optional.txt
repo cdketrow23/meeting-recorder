@@ -1,0 +1,4 @@
+# Optional, much faster transcription backend. Install with
+#   pip install -r requirements-optional.txt
+# Note: this downloads large models and uses ffmpeg at runtime.
+faster-whisper==1.0.3

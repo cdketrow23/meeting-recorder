@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.spec linguist-vendored
+*.yml linguist-vendored
+*.toml linguist-vendored
