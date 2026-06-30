@@ -54,10 +54,23 @@ The one-file executable is at `dist\MeetingRecorder.exe`.
 
 ## Quick start
 
-1. Launch `MeetingRecorder.exe`.
-2. Click **Choose output folder** (defaults to `Downloads\MeetingRecorder`).
-3. Pick which sources to capture (mic, system audio, or both).
-4. Click **Record** — the window title and badge show "● Recording".
-5. Click **Stop** — the app finalizes the WAV and produces a transcript next to it.
+1. **Get the executable** in one of three ways:
+
+   - Download `MeetingRecorder.exe` from *GitHub Releases* → `https://github.com/cdketrow23/meeting-recorder/releases/latest` (built automatically by CI when you cut a tag).
+   - Build it on the target Windows machine — see "Building the Windows .exe" below.
+   - Pull the tarball that is mirrored to the NAS (handy for BF-Mk2):
+
+     ```powershell
+     # On BF-Mk2
+     powershell -ExecutionPolicy Bypass -File .\scripts\bf_mk2_copy_to_desktop.ps1
+     ```
+
+     This copies the latest tarball from `\\192.168.0.117\ketrow-family\Neo Infrastructure\meeting-recorder\`, verifies SHA-256, extracts it to your Desktop, and tells you what to run next.
+
+2. Launch `MeetingRecorder.exe`. You do *not* need to install Python if you used the release download.
+3. Click **Choose output folder** (defaults to `Downloads\MeetingRecorder`).
+4. Pick which sources to capture (mic, system audio, or both).
+5. Click **Record** — the window title and a red badge show "● Recording".
+6. Click **Stop** — the app finalizes the WAV and produces the transcripts.
 
 See `docs/HOW_TO_USE.md` for the full walkthrough, file layouts, troubleshooting, and the optional Whisper backend.
