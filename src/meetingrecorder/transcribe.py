@@ -11,14 +11,86 @@ import json
 import logging
 import os
 import queue
+import shutil
 import threading
+import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol
 
+import numpy as np
+
 from .transcript_format import Segment, Transcript
 
 _log = logging.getLogger(__name__)
+
+VOSK_SMALL_EN_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+VOSK_SMALL_EN_DIRNAME = "vosk-model-small-en-us-0.15"
+
+
+def _app_data_dir() -> Path:
+    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        return Path(os.environ["LOCALAPPDATA"]) / "MeetingRecorder"
+    return Path.home() / ".cache" / "meetingrecorder"
+
+
+def _cached_vosk_model_dir() -> Path:
+    return _app_data_dir() / "models" / VOSK_SMALL_EN_DIRNAME
+
+
+def ensure_vosk_model(model_path: Optional[str] = None) -> Path:
+    """Return a usable Vosk model directory, downloading the small English model if needed.
+
+    This makes transcription work out-of-the-box for normal users instead of
+    silently creating only a WAV file when the model has not been manually
+    installed yet.
+    """
+    explicit = model_path or os.environ.get("VOSK_MODEL")
+    if explicit:
+        p = Path(explicit).expanduser()
+        if p.is_dir():
+            return p
+        raise RuntimeError(f"configured VOSK_MODEL does not exist or is not a directory: {p}")
+
+    candidates = [
+        Path.cwd() / VOSK_SMALL_EN_DIRNAME,
+        Path.cwd() / "vosk-model",
+        Path.home() / "Documents" / "MeetingRecorder" / "vosk-model",
+        _cached_vosk_model_dir(),
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return c
+
+    target = _cached_vosk_model_dir()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    zip_path = target.parent / f"{VOSK_SMALL_EN_DIRNAME}.zip"
+    tmp_dir = target.parent / f".{VOSK_SMALL_EN_DIRNAME}.tmp"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    if target.exists():
+        shutil.rmtree(target, ignore_errors=True)
+    try:
+        _log.info("Downloading Vosk model to %s", zip_path)
+        urllib.request.urlretrieve(VOSK_SMALL_EN_URL, zip_path)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmp_dir)
+        extracted = tmp_dir / VOSK_SMALL_EN_DIRNAME
+        if not extracted.is_dir():
+            dirs = [p for p in tmp_dir.iterdir() if p.is_dir()]
+            if len(dirs) == 1:
+                extracted = dirs[0]
+        if not extracted.is_dir():
+            raise RuntimeError("downloaded Vosk zip did not contain a model directory")
+        shutil.move(str(extracted), str(target))
+        return target
+    finally:
+        try:
+            zip_path.unlink()
+        except FileNotFoundError:
+            pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 class Transcriber(Protocol):
@@ -43,27 +115,10 @@ class VoskTranscriber:
         # Imported lazily so the rest of the app doesn't need Vosk installed
         from vosk import KaldiRecognizer, Model
 
-        path = self.model_path or os.environ.get("VOSK_MODEL")
-        if not path:
-            # Look for a downloaded model on common locations
-            candidates = [
-                Path.home() / "Documents" / "MeetingRecorder" / "vosk-model",
-                Path.home() / ".cache" / "meetingrecorder" / "vosk-model",
-                Path("vosk-model"),
-            ]
-            for c in candidates:
-                if c.exists():
-                    path = str(c.resolve())
-                    break
-        if not path or not Path(path).is_dir():
-            raise RuntimeError(
-                "Vosk model not found. Download a small English model from "
-                "https://alphacephei.com/vosk/models and unpack it into "
-                "'vosk-model' next to the app, or set the VOSK_MODEL env var."
-            )
+        path = ensure_vosk_model(self.model_path)
         self._Model = Model
         self._KaldiRecognizer = KaldiRecognizer
-        self._model = Model(path)
+        self._model = Model(str(path))
         self._recognizer = KaldiRecognizer(self._model, self.sample_rate)
         self._recognizer.SetWords(True)
         self._q: "queue.Queue[bytes]" = queue.Queue()
@@ -77,7 +132,7 @@ class VoskTranscriber:
         if audio_chunk is None:
             return
         if hasattr(audio_chunk, "ndim"):
-            data = audio_chunk.tobytes()
+            data = _float_audio_to_pcm16_bytes(audio_chunk)
         else:
             data = bytes(audio_chunk)
         self._q.put(data)
@@ -97,7 +152,7 @@ class VoskTranscriber:
 
     def _run(self) -> None:
         buffer_count = 0
-        while not self._stop.is_set():
+        while not self._stop.is_set() or not self._q.empty():
             try:
                 data = self._q.get(timeout=0.2)
             except queue.Empty:
@@ -196,6 +251,16 @@ def transcribe_file(
     return Transcript(segments=[], engine="none", language=language)
 
 
+def _float_audio_to_pcm16_bytes(audio_chunk) -> bytes:
+    """Convert soundfile float audio arrays to mono 16-bit PCM bytes for Vosk."""
+    arr = np.asarray(audio_chunk, dtype=np.float32)
+    if arr.ndim > 1:
+        arr = arr.mean(axis=1)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    arr = np.clip(arr, -1.0, 1.0)
+    return (arr * 32767.0).astype("<i2").tobytes()
+
+
 def _read_wav_chunks(wav_path: Path, chunk_seconds: float = 0.5):
     import soundfile as sf
 
@@ -210,19 +275,12 @@ def _read_wav_chunks(wav_path: Path, chunk_seconds: float = 0.5):
 
 
 def _transcribe_with_vosk(wav_path: Path, language: str) -> Transcript:
-    sr_seen: Optional[int] = None
     rec: Optional[VoskTranscriber] = None
-    try:
-        for data, sr in _read_wav_chunks(wav_path):
-            sr_seen = sr_seen or sr
-            if rec is None:
-                rec = VoskTranscriber(sample_rate=sr, language=language)
-            rec.feed(data)
-        transcript = rec.finish() if rec else Transcript(engine="vosk", language=language)
-    finally:
-        if rec is not None:
-            rec.finish()
-    return transcript
+    for data, sr in _read_wav_chunks(wav_path):
+        if rec is None:
+            rec = VoskTranscriber(sample_rate=sr, language=language)
+        rec.feed(data)
+    return rec.finish() if rec else Transcript(engine="vosk", language=language)
 
 
 def _transcribe_with_whisper(wav_path: Path, language: str) -> Transcript:
