@@ -225,16 +225,31 @@ class Recorder:
                     ) from exc
 
     def _make_input_stream(self, channels: int, blocksize: int, wasapi_loopback: bool) -> sd.Stream:
-        """Create an input stream with WASAPI-loopback on Windows when requested."""
+        """Create an input stream.
+
+        For microphone capture, this is the default input device.
+
+        For Windows speaker/output capture, this must be the **default output
+        device** opened through WASAPI loopback. Opening the default input with
+        ``WasapiSettings(loopback=True)`` is not enough and silently misses the
+        speaker mix on many machines.
+        """
         kwargs = dict(
             samplerate=self.config.sample_rate,
             blocksize=blocksize,
             dtype="float32",
             callback=self._make_callback("system" if wasapi_loopback else "mic"),
         )
-        if wasapi_loopback and sd.query_hostapi(0).get("name", "").lower().startswith("wasapi"):
-            kwargs["extra_settings"] = sd.WasapiSettings(loopback=wasapi_loopback)
-        kwargs["channels"] = channels
+        if wasapi_loopback:
+            device_index, device_info = _default_wasapi_output_device()
+            out_channels = int(device_info.get("max_output_channels", 0) or 0)
+            if out_channels <= 0:
+                raise AudioError("default WASAPI output device has no output channels")
+            kwargs["device"] = device_index
+            kwargs["channels"] = min(max(1, channels), out_channels)
+            kwargs["extra_settings"] = sd.WasapiSettings(loopback=True)
+        else:
+            kwargs["channels"] = channels
         return sd.InputStream(**kwargs)
 
     def _make_callback(self, source: str):
@@ -260,14 +275,69 @@ class Recorder:
                 pass
 
 
-def list_input_devices() -> list[dict]:
-    """Return a snapshot of available input devices for the settings dialog."""
+def _hostapis() -> list[dict]:
+    """Return sounddevice host APIs as a list, normalizing old/new versions."""
+    apis = sd.query_hostapis()
+    if isinstance(apis, dict):
+        return [apis]
+    return list(apis)
+
+
+def _devices() -> list[dict]:
+    """Return sounddevice devices as a list, with an ``index`` key filled in."""
     devices = sd.query_devices()
+    if isinstance(devices, dict):
+        devices = [devices]
     out: list[dict] = []
     for idx, d in enumerate(devices):
+        dd = dict(d)
+        dd.setdefault("index", idx)
+        out.append(dd)
+    return out
+
+
+def _wasapi_hostapi_index() -> int | None:
+    """Return the first WASAPI host API index, or ``None`` if unavailable."""
+    for idx, api in enumerate(_hostapis()):
+        if "wasapi" in str(api.get("name", "")).lower():
+            return idx
+    return None
+
+
+def _default_wasapi_output_device() -> tuple[int, dict]:
+    """Return ``(device_index, device_info)`` for the default WASAPI speaker.
+
+    Windows speaker capture is implemented by opening the *output* device with
+    WASAPI loopback enabled. Prefer the WASAPI host API's own default output;
+    fall back to any output device on the WASAPI host API.
+    """
+    api_index = _wasapi_hostapi_index()
+    if api_index is None:
+        raise AudioError("WASAPI host API is not available on this machine")
+
+    apis = _hostapis()
+    api = apis[api_index]
+    devices = _devices()
+    default_idx = api.get("default_output_device")
+    if isinstance(default_idx, int) and 0 <= default_idx < len(devices):
+        info = devices[default_idx]
+        if int(info.get("max_output_channels", 0) or 0) > 0:
+            return int(info.get("index", default_idx)), info
+
+    for idx, info in enumerate(devices):
+        if info.get("hostapi") == api_index and int(info.get("max_output_channels", 0) or 0) > 0:
+            return int(info.get("index", idx)), info
+
+    raise AudioError("no WASAPI output/speaker device found for loopback capture")
+
+
+def list_input_devices() -> list[dict]:
+    """Return a snapshot of available input devices for the settings dialog."""
+    out: list[dict] = []
+    for idx, d in enumerate(_devices()):
         if d.get("max_input_channels", 0) > 0:
             out.append({
-                "index": idx,
+                "index": int(d.get("index", idx)),
                 "name": d.get("name"),
                 "host_api": d.get("hostapi"),
                 "channels": d.get("max_input_channels"),
@@ -276,8 +346,9 @@ def list_input_devices() -> list[dict]:
 
 
 def has_loopback() -> bool:
-    """Best-effort check: does the host API expose WASAPI loopback?"""
+    """Best-effort check: can Windows speaker/output audio be captured?"""
     try:
-        return sd.query_hostapi(0).get("name", "").lower().startswith("wasapi")
+        _default_wasapi_output_device()
+        return True
     except Exception:
         return False
