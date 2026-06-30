@@ -174,22 +174,16 @@ class GitHub:
         return code
 
     def push(self, slug, exclude_paths=None):
-        """git push via HTTPS.
-
-        If ``exclude_paths`` is given (list of repo-relative paths), the
-        commit with those paths is rebased out of the tip before pushing,
-        then the original commit is restored locally. This handles the case
-        where the token lacks scopes GitHub enforces on commit content
-        (e.g. ``workflow`` for .github/workflows/*.yml).
+        """git push via HTTPS. ``exclude_paths`` lets us temporarily drop files
+        from the pushed tip to work around GitHub-side content gating.
         """
         url = "https://oauth2:" + self.token + "@github.com/" + slug + ".git"
         run_git("remote", "remove", "origin", check=False)
         run_git("remote", "add", "origin", url, check=False)
 
         excluded_summary = ""
+        push_target = "main"
         if exclude_paths:
-            # Build a fresh branch `main-stripped` whose tip lacks the offending paths
-            # but whose history is the same up to HEAD.
             head_sha = run_git("rev-parse", "HEAD").stdout.strip()
             stripped_branch = "mr-publish-stripped"
             run_git("branch", "-f", stripped_branch, "HEAD", check=False)
@@ -197,13 +191,14 @@ class GitHub:
             run_git("rm", "-rq", "--", *exclude_paths, check=False)
             run_git("commit", "-q", "--amend", "--no-edit", check=False)
             new_sha = run_git("rev-parse", "HEAD").stdout.strip()
-            excluded_summary = "stripped " + ", ".join(exclude_paths) + " from tip (was " + head_sha[:12] + ", now " + new_sha[:12] + ")"
-            # Push the stripped branch directly
+            excluded_summary = (
+                "stripped " + ", ".join(exclude_paths)
+                + " from tip (was " + head_sha[:12] + ", now " + new_sha[:12] + ")"
+            )
             push_target = stripped_branch
-        else:
-            push_target = "main"
 
-        res = run_git("push", "-u", "origin", push_target + ":main", "--force-with-lease=refs/heads/main", check=False)
+        res = run_git("push", "-u", "origin", push_target + ":main",
+                      "--force-with-lease=refs/heads/main", check=False)
         ok = res.returncode == 0
         full_log = ((res.stderr or "") + "\n" + (res.stdout or "")).strip()
         err_msg = ""
@@ -211,13 +206,20 @@ class GitHub:
         if not ok:
             nonblank = [ln for ln in full_log.splitlines() if ln.strip()]
             err_msg = nonblank[-1] if nonblank else "push failed"
-            err_msg_full = "\n".join(nonblank[-8:])  # last few lines for diagnostics
-        # Restore local tree state always
+            err_msg_full = "\n".join(nonblank[-8:])
         if exclude_paths:
             run_git("checkout", "-q", "main", check=False)
-            run_git("branch", "-D", stripped_branch, check=False)
+            run_git("branch", "-D", push_target, check=False)
         run_git("remote", "remove", "origin", check=False)
         return ok, err_msg, err_msg_full, excluded_summary
+
+
+def is_workflow_scope_rejection(emsg):
+    """Heuristic: does ``emsg`` look like a GitHub PAT workflow-scope rejection?"""
+    e = emsg.lower()
+    return (
+        ("workflow" in e and ("personal access token" in e or "refusing" in e or "without `workflow`" in e or "without 'workflow'" in e))
+    )
 
 
 def main():
@@ -287,7 +289,7 @@ def main():
                 if "rate limit" in emsg or "secondary rate" in emsg:
                     reason_fallback = "rate limit"
                     warn("Push failed: " + err_msg + " (full: " + err_msg_full + ")")
-                elif "workflow" in emsg and ("personal access token" in emsg or "workflow scope" in emsg or "refusing" in emsg):
+                elif is_workflow_scope_rejection(emsg):
                     # Token lacks the `workflow` scope. Try again with the offending paths held back.
                     warn("GitHub rejected because the token lacks the 'workflow' scope. Retrying without .github/workflows/*.")
                     warn("Original rejection:")

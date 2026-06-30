@@ -47,3 +47,23 @@ def test_publish_writes_manifest_and_tarball():
         data = json.loads(manifest.read_text())
         assert isinstance(data, list)
         assert data[-1]["fallback_reason"] in {"no token", "rate limit", "no reason set", ""}
+
+
+def test_workflow_scope_detection():
+    """Confirm the helper matches real GitHub rejection text and rejects unrelated errors."""
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        from publish import is_workflow_scope_rejection
+    finally:
+        sys.path.pop(0)
+    assert is_workflow_scope_rejection(
+        "! [remote rejected] main -> main (refusing to allow a Personal Access Token to "
+        "create or update workflow `.github/workflows/build-windows.yml` without "
+        "`workflow` scope)"
+    )
+    assert is_workflow_scope_rejection(
+        "...refusing to allow a personal access token to create or update workflow ..."
+    )
+    assert not is_workflow_scope_rejection("API rate limit exceeded for installation")
+    assert not is_workflow_scope_rejection("repository not found")
+    assert not is_workflow_scope_rejection("")
