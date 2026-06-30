@@ -197,8 +197,7 @@ class GitHub:
             )
             push_target = stripped_branch
 
-        res = run_git("push", "-u", "origin", push_target + ":main",
-                      "--force-with-lease=refs/heads/main", check=False)
+        res = run_git("push", "-u", "origin", push_target + ":main", "--force", check=False)
         ok = res.returncode == 0
         full_log = ((res.stderr or "") + "\n" + (res.stdout or "")).strip()
         err_msg = ""
