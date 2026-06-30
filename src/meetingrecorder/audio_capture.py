@@ -212,8 +212,14 @@ class Recorder:
         shutil.rmtree(self._raw_dir(), ignore_errors=True)
 
     def _write_metadata(self) -> None:
-        self._metadata["session_stop_monotonic"] = time.monotonic()
-        self._metadata["duration_seconds"] = self.elapsed_seconds
+        if "session_start_monotonic" not in self._metadata:
+            self._metadata["session_start_monotonic"] = self._started_at
+            self._metadata["sample_rate"] = self.config.sample_rate
+            self._metadata["channels"] = self.config.channels
+            self._metadata["final_wav"] = str(self.config.output_path)
+        stop_at = time.monotonic()
+        self._metadata["session_stop_monotonic"] = stop_at
+        self._metadata["duration_seconds"] = max(0.0, stop_at - (self._started_at or stop_at))
         self._metadata["sources"] = self._source_meta
         path = self._metadata_path()
         path.parent.mkdir(parents=True, exist_ok=True)
