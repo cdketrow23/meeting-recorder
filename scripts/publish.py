@@ -188,31 +188,34 @@ class GitHub:
 
         excluded_summary = ""
         if exclude_paths:
+            # Build a fresh branch `main-stripped` whose tip lacks the offending paths
+            # but whose history is the same up to HEAD.
             head_sha = run_git("rev-parse", "HEAD").stdout.strip()
-            # Make a backup branch so we can restore later
-            backup_branch = "mr-pre-workflow-strip"
-            run_git("branch", "-f", backup_branch, "HEAD", check=False)
-            run_git("checkout", "-q", backup_branch, check=False)
-            # Remove the offending paths, amend the commit
+            stripped_branch = "mr-publish-stripped"
+            run_git("branch", "-f", stripped_branch, "HEAD", check=False)
+            run_git("checkout", "-q", stripped_branch, check=False)
             run_git("rm", "-rq", "--", *exclude_paths, check=False)
             run_git("commit", "-q", "--amend", "--no-edit", check=False)
             new_sha = run_git("rev-parse", "HEAD").stdout.strip()
             excluded_summary = "stripped " + ", ".join(exclude_paths) + " from tip (was " + head_sha[:12] + ", now " + new_sha[:12] + ")"
+            # Push the stripped branch directly
+            push_target = stripped_branch
+        else:
+            push_target = "main"
 
-        res = run_git("push", "-u", "origin", "main", "--force-with-lease", check=False)
+        res = run_git("push", "-u", "origin", push_target + ":main", "--force-with-lease=refs/heads/main", check=False)
         ok = res.returncode == 0
         full_log = ((res.stderr or "") + "\n" + (res.stdout or "")).strip()
-        # Keep the last few lines so the reason is visible; fall back to "" if all blank
         err_msg = ""
+        err_msg_full = ""
         if not ok:
             nonblank = [ln for ln in full_log.splitlines() if ln.strip()]
             err_msg = nonblank[-1] if nonblank else "push failed"
-            err_msg_full = "\n".join(nonblank[-6:])  # last 6 lines for diagnostics
-        else:
-            err_msg_full = ""
-        # Always restore the local tree state
+            err_msg_full = "\n".join(nonblank[-8:])  # last few lines for diagnostics
+        # Restore local tree state always
         if exclude_paths:
             run_git("checkout", "-q", "main", check=False)
+            run_git("branch", "-D", stripped_branch, check=False)
         run_git("remote", "remove", "origin", check=False)
         return ok, err_msg, err_msg_full, excluded_summary
 
