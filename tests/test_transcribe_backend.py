@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 import sys
 import types
-from pathlib import Path
 
 import numpy as np
 import pytest

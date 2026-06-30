@@ -15,7 +15,6 @@ easier to diagnose than live-mixing callbacks directly into the final file.
 from __future__ import annotations
 
 import json
-import math
 import queue
 import shutil
 import threading

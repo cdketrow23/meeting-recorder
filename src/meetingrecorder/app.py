@@ -21,7 +21,6 @@ import sys
 import threading
 import tkinter as tk
 import traceback
-from dataclasses import asdict
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
@@ -398,7 +397,7 @@ class App:
             try:
                 wav_path = self._recorder.stop() if self._recorder is not None else None
             except Exception as exc:
-                self.root.after(0, lambda: self._surface_error(exc))
+                self.root.after(0, lambda exc=exc: self._surface_error(exc))
                 self._recorder = None
                 self._finalizing = False
                 return
@@ -415,7 +414,7 @@ class App:
                     write_transcript(transcript, self._current_paths)
                 except Exception as exc:
                     _log.warning("Transcription failed: %s", exc)
-                    self.root.after(0, lambda: self._surface_error(exc))
+                    self.root.after(0, lambda exc=exc: self._surface_error(exc))
             self.root.after(0, self._after_stop_state)
 
         threading.Thread(target=_do_stop, daemon=True).start()
