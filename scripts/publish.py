@@ -173,15 +173,40 @@ class GitHub:
         )
         return code
 
-    def push(self, slug):
+    def push(self, slug, exclude_paths=None):
+        """git push via HTTPS.
+
+        If ``exclude_paths`` is given (list of repo-relative paths), the
+        commit with those paths is rebased out of the tip before pushing,
+        then the original commit is restored locally. This handles the case
+        where the token lacks scopes GitHub enforces on commit content
+        (e.g. ``workflow`` for .github/workflows/*.yml).
+        """
         url = "https://oauth2:" + self.token + "@github.com/" + slug + ".git"
         run_git("remote", "remove", "origin", check=False)
         run_git("remote", "add", "origin", url, check=False)
+
+        excluded_summary = ""
+        if exclude_paths:
+            head_sha = run_git("rev-parse", "HEAD").stdout.strip()
+            # Make a backup branch so we can restore later
+            backup_branch = "mr-pre-workflow-strip"
+            run_git("branch", "-f", backup_branch, "HEAD", check=False)
+            run_git("checkout", "-q", backup_branch, check=False)
+            # Remove the offending paths, amend the commit
+            run_git("rm", "-rq", "--", *exclude_paths, check=False)
+            run_git("commit", "-q", "--amend", "--no-edit", check=False)
+            new_sha = run_git("rev-parse", "HEAD").stdout.strip()
+            excluded_summary = "stripped " + ", ".join(exclude_paths) + " from tip (was " + head_sha[:12] + ", now " + new_sha[:12] + ")"
+
         res = run_git("push", "-u", "origin", "main", "--force-with-lease", check=False)
-        if res.returncode == 0:
-            return True, ""
-        msg = (res.stderr or res.stdout or "").strip()
-        return False, (msg.splitlines()[-1] if msg else "push failed")
+        ok = res.returncode == 0
+        msg = (res.stderr or res.stdout or "").strip().splitlines()[-1] if not ok else ""
+        # Always restore the local tree state
+        if exclude_paths:
+            run_git("checkout", "-q", "main", check=False)
+        run_git("remote", "remove", "origin", check=False)
+        return ok, msg, excluded_summary
 
 
 def main():
@@ -237,17 +262,34 @@ def main():
                     log("Created https://github.com/" + slug)
             else:
                 log("Repo " + slug + " already exists; pushing.")
-            ok, err_msg = gh.push(slug)
+            ok, err_msg, excluded_summary = gh.push(slug)
+            workflow_stripped = excluded_summary if excluded_summary else ""
             if ok:
                 pushed = True
                 log("Push complete: https://github.com/" + slug)
+                if workflow_stripped:
+                    warn("Note: " + workflow_stripped)
+                    warn("The .github/workflows/*.yml files require a token with the 'workflow' scope. They are in the local commit and the tarball, but NOT on the remote until the scope is added.")
             else:
                 emsg = err_msg.lower()
                 if "rate limit" in emsg or "secondary rate" in emsg:
                     reason_fallback = "rate limit"
+                elif "workflow" in emsg and "personal access token" in emsg:
+                    # Token lacks the `workflow` scope. Try again with the offending paths held back.
+                    warn("GitHub rejected because the token lacks the 'workflow' scope. Retrying without .github/workflows/*.")
+                    ok2, err_msg2, excluded_summary2 = gh.push(slug, exclude_paths=[".github/workflows/build-windows.yml", ".github/workflows/lint.yml"])
+                    if ok2:
+                        pushed = True
+                        reason_fallback = "workflows stripped (token missing 'workflow' scope)"
+                        if excluded_summary2:
+                            warn("Note: " + excluded_summary2)
+                        log("Push complete (workflows omitted): https://github.com/" + slug)
+                    else:
+                        reason_fallback = "push failed (retry): " + err_msg2
+                        warn("Retry failed: " + err_msg2)
                 else:
                     reason_fallback = "push failed: " + err_msg
-                warn("Push failed: " + err_msg + ". Falling back.")
+                    warn("Push failed: " + err_msg + ". Falling back.")
 
     for m in NAS_MIRRORS:
         try:
