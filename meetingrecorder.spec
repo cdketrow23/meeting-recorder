@@ -26,7 +26,7 @@ hiddenimports = [
 ]
 
 a = Analysis(
-    ["src/meetingrecorder/__main__.py"],
+    ["pyinstaller_entry.py"],
     pathex=["src"],
     binaries=[],
     datas=datas,
