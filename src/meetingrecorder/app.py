@@ -21,9 +21,10 @@ import sys
 import threading
 import tkinter as tk
 import traceback
+from functools import partial
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import Any, Optional
 
 from . import __version__
 from .audio_capture import (
@@ -138,7 +139,7 @@ class App:
         style.configure("Idle.TLabel", foreground="white", background="#1f6feb", padding=6)
 
         root = self.root
-        pad = {"padx": 8, "pady": 4}
+        pad: dict[str, Any] = {"padx": 8, "pady": 4}
 
         # Status bar at the top
         header = ttk.Frame(root)
@@ -397,7 +398,7 @@ class App:
             try:
                 wav_path = self._recorder.stop() if self._recorder is not None else None
             except Exception as exc:
-                self.root.after(0, lambda exc=exc: self._surface_error(exc))
+                self.root.after(0, partial(self._surface_error, exc))
                 self._recorder = None
                 self._finalizing = False
                 return
@@ -414,7 +415,7 @@ class App:
                     write_transcript(transcript, self._current_paths)
                 except Exception as exc:
                     _log.warning("Transcription failed: %s", exc)
-                    self.root.after(0, lambda exc=exc: self._surface_error(exc))
+                    self.root.after(0, partial(self._surface_error, exc))
             self.root.after(0, self._after_stop_state)
 
         threading.Thread(target=_do_stop, daemon=True).start()

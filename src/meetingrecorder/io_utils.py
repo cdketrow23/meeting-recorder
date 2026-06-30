@@ -60,7 +60,12 @@ def default_output_dir(user_home: Path | None = None) -> Path:
         home,
     ]
     seen: set[Path] = set()
-    deduped = [c for c in candidates if not (c in seen or seen.add(c))]
+    deduped: list[Path] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        deduped.append(candidate)
     for c in deduped:
         try:
             c.mkdir(parents=True, exist_ok=True)
