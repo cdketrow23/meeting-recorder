@@ -23,6 +23,7 @@ import math
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -169,33 +170,87 @@ class Recorder:
     def _run(self) -> None:
         try:
             self._open_streams()
+            expected_sources = self._expected_sources()
+            source_buffers: dict[str, deque[np.ndarray]] = {source: deque() for source in expected_sources}
+            last_write_at = time.monotonic()
             while not self._stop.is_set() and self.elapsed_seconds < self.config.max_seconds:
                 try:
                     source, chunk = self._q.get(timeout=0.2)
                 except queue.Empty:
+                    if source_buffers and time.monotonic() - last_write_at >= self.config.chunk_seconds * 2:
+                        mixed = self._pop_mixed_chunk(source_buffers, require_all=False)
+                        if mixed is not None:
+                            self._write_chunk(mixed)
+                            last_write_at = time.monotonic()
                     continue
                 if chunk.size == 0:
                     continue
-                if self.config.channels == 1 and chunk.ndim == 2:
-                    chunk = chunk.mean(axis=1, keepdims=False)
-                if chunk.ndim == 1:
-                    chunk = chunk.reshape(-1, 1)
-                if chunk.shape[1] != self.config.channels:
-                    # last-ditch: take the first channel
-                    chunk = chunk[:, : self.config.channels]
-                peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
-                if peak > self._level_max:
-                    self._level_max = peak
-                if self._writer is not None:
-                    self._writer.write(chunk)
-                    self._frames_written += chunk.shape[0]
-                if self._on_amplitude:
-                    try:
-                        self._on_amplitude(self._level_max)
-                    except Exception as exc:
-                        self._safe_error(exc)
+                if len(expected_sources) <= 1 or source not in source_buffers:
+                    self._write_chunk(chunk)
+                    last_write_at = time.monotonic()
+                    continue
+                source_buffers[source].append(chunk)
+                while True:
+                    mixed = self._pop_mixed_chunk(source_buffers, require_all=True)
+                    if mixed is None:
+                        break
+                    self._write_chunk(mixed)
+                    last_write_at = time.monotonic()
         except Exception as exc:
             self._safe_error(exc)
+
+    def _expected_sources(self) -> tuple[str, ...]:
+        sources: list[str] = []
+        if self.config.capture_mic:
+            sources.append("mic")
+        if self.config.capture_system:
+            sources.append("system")
+        return tuple(sources)
+
+    def _normalize_chunk(self, chunk: np.ndarray) -> np.ndarray:
+        chunk = np.asarray(chunk, dtype=np.float32)
+        if self.config.channels == 1 and chunk.ndim == 2:
+            chunk = chunk.mean(axis=1, keepdims=False)
+        if chunk.ndim == 1:
+            chunk = chunk.reshape(-1, 1)
+        if chunk.shape[1] < self.config.channels:
+            chunk = np.tile(chunk[:, :1], (1, self.config.channels))
+        elif chunk.shape[1] != self.config.channels:
+            # last-ditch: take the first configured channels
+            chunk = chunk[:, : self.config.channels]
+        return chunk
+
+    def _pop_mixed_chunk(self, source_buffers: dict[str, deque[np.ndarray]], require_all: bool) -> np.ndarray | None:
+        if require_all and not all(source_buffers[source] for source in source_buffers):
+            return None
+        chunks = [source_buffers[source].popleft() for source in source_buffers if source_buffers[source]]
+        if not chunks:
+            return None
+        return self._mix_chunks(chunks)
+
+    def _mix_chunks(self, chunks: Iterable[np.ndarray]) -> np.ndarray:
+        normalized = [self._normalize_chunk(chunk) for chunk in chunks if chunk.size]
+        if not normalized:
+            return np.zeros((0, self.config.channels), dtype=np.float32)
+        max_frames = max(chunk.shape[0] for chunk in normalized)
+        mixed = np.zeros((max_frames, self.config.channels), dtype=np.float32)
+        for chunk in normalized:
+            mixed[: chunk.shape[0], : chunk.shape[1]] += chunk
+        return np.clip(mixed, -1.0, 1.0)
+
+    def _write_chunk(self, chunk: np.ndarray) -> None:
+        chunk = self._normalize_chunk(chunk)
+        peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+        if peak > self._level_max:
+            self._level_max = peak
+        if self._writer is not None:
+            self._writer.write(chunk)
+            self._frames_written += chunk.shape[0]
+        if self._on_amplitude:
+            try:
+                self._on_amplitude(self._level_max)
+            except Exception as exc:
+                self._safe_error(exc)
 
     def _open_streams(self) -> None:
         blocksize = max(1, int(self.config.chunk_seconds * self.config.sample_rate))

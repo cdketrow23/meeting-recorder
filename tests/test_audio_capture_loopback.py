@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import sys
 import types
+from collections import deque
 
+import numpy as np
 import pytest
 
 from meetingrecorder import audio_capture
@@ -108,3 +110,33 @@ def test_has_loopback_false_without_soundcard(monkeypatch):
     monkeypatch.setitem(sys.modules, "soundcard", None)
 
     assert audio_capture.has_loopback() is False
+
+
+def test_mixes_mic_and_system_chunks_instead_of_appending_alternating_chunks(tmp_path):
+    recorder = audio_capture.Recorder(
+        audio_capture.RecorderConfig(output_path=tmp_path / "x.wav", capture_mic=True, capture_system=True)
+    )
+    mic = np.zeros((4, 1), dtype=np.float32)
+    system = np.full((4, 1), 0.25, dtype=np.float32)
+    buffers = {"mic": deque([mic]), "system": deque([system])}
+
+    mixed = recorder._pop_mixed_chunk(buffers, require_all=True)
+
+    assert mixed.shape == (4, 1)
+    np.testing.assert_allclose(mixed, system)
+    assert not buffers["mic"]
+    assert not buffers["system"]
+
+
+def test_mixing_clips_combined_sources_and_preserves_single_timeline(tmp_path):
+    recorder = audio_capture.Recorder(
+        audio_capture.RecorderConfig(output_path=tmp_path / "x.wav", capture_mic=True, capture_system=True)
+    )
+
+    mixed = recorder._mix_chunks([
+        np.full((3, 1), 0.75, dtype=np.float32),
+        np.full((3, 1), 0.75, dtype=np.float32),
+    ])
+
+    assert mixed.shape == (3, 1)
+    np.testing.assert_allclose(mixed, np.ones((3, 1), dtype=np.float32))
