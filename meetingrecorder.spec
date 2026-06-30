@@ -18,6 +18,7 @@ datas = []
 
 hiddenimports = [
     "sounddevice",
+    "soundcard",
     "soundfile",
     "numpy",
     "vosk",

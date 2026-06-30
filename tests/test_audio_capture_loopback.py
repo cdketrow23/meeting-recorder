@@ -1,15 +1,11 @@
 from __future__ import annotations
 
+import sys
 import types
 
 import pytest
 
 from meetingrecorder import audio_capture
-
-
-class _FakeWasapiSettings:
-    def __init__(self, loopback: bool = False):
-        self.loopback = loopback
 
 
 def _patch_sounddevice(monkeypatch, hostapis, devices):
@@ -21,9 +17,20 @@ def _patch_sounddevice(monkeypatch, hostapis, devices):
 
     monkeypatch.setattr(audio_capture.sd, "query_hostapis", lambda: hostapis)
     monkeypatch.setattr(audio_capture.sd, "query_devices", lambda: devices)
-    monkeypatch.setattr(audio_capture.sd, "WasapiSettings", _FakeWasapiSettings)
     monkeypatch.setattr(audio_capture.sd, "InputStream", fake_input_stream)
     return created
+
+
+def _patch_soundcard(monkeypatch, speaker_name="Speakers", loopback_name="Speakers"):
+    speaker = types.SimpleNamespace(name=speaker_name)
+    loopback = types.SimpleNamespace(name=loopback_name)
+    fake = types.SimpleNamespace(
+        default_speaker=lambda: speaker,
+        get_microphone=lambda name, include_loopback=False: loopback,
+        all_microphones=lambda include_loopback=False: [loopback],
+    )
+    monkeypatch.setitem(sys.modules, "soundcard", fake)
+    return speaker, loopback
 
 
 def test_wasapi_output_device_prefers_default_speaker(monkeypatch):
@@ -42,7 +49,6 @@ def test_wasapi_output_device_prefers_default_speaker(monkeypatch):
 
     assert idx == 2
     assert info["name"] == "Speakers (Realtek)"
-    assert audio_capture.has_loopback() is True
 
 
 def test_wasapi_output_device_falls_back_to_any_wasapi_speaker(monkeypatch):
@@ -59,32 +65,46 @@ def test_wasapi_output_device_falls_back_to_any_wasapi_speaker(monkeypatch):
     assert info["name"] == "Headphones"
 
 
-def test_system_loopback_stream_uses_output_device_and_loopback(monkeypatch, tmp_path):
-    hostapis = [{"name": "Windows WASAPI", "default_output_device": 1}]
-    devices = [
-        {"name": "Mic", "hostapi": 0, "max_input_channels": 1, "max_output_channels": 0},
-        {"name": "Speakers", "hostapi": 0, "max_input_channels": 0, "max_output_channels": 2},
-    ]
-    created = _patch_sounddevice(monkeypatch, hostapis, devices)
+def test_default_soundcard_loopback_uses_default_speaker(monkeypatch):
+    _speaker, loopback = _patch_soundcard(
+        monkeypatch,
+        speaker_name="Digital Output (High Definition Audio Device)",
+        loopback_name="Digital Output (High Definition Audio Device)",
+    )
+
+    selected = audio_capture._default_soundcard_loopback()
+
+    assert selected is loopback
+    assert audio_capture.has_loopback() is True
+
+
+def test_default_soundcard_loopback_fuzzy_fallback(monkeypatch):
+    speaker = types.SimpleNamespace(name="Odyssey G95C (NVIDIA High Definition Audio)")
+    exact_error = RuntimeError("exact lookup failed")
+    candidate = types.SimpleNamespace(name="Loopback Odyssey G95C (NVIDIA High Definition Audio)")
+    fake = types.SimpleNamespace(
+        default_speaker=lambda: speaker,
+        get_microphone=lambda name, include_loopback=False: (_ for _ in ()).throw(exact_error),
+        all_microphones=lambda include_loopback=False: [candidate],
+    )
+    monkeypatch.setitem(sys.modules, "soundcard", fake)
+
+    selected = audio_capture._default_soundcard_loopback()
+
+    assert selected is candidate
+
+
+def test_make_input_stream_rejects_loopback_because_soundcard_handles_system_audio(monkeypatch, tmp_path):
+    _patch_sounddevice(monkeypatch, [], [])
     recorder = audio_capture.Recorder(
         audio_capture.RecorderConfig(output_path=tmp_path / "x.wav", capture_mic=False, capture_system=True)
     )
 
-    recorder._make_input_stream(channels=1, blocksize=8000, wasapi_loopback=True)
-
-    assert created, "InputStream should have been created"
-    kwargs = created[0]
-    assert kwargs["device"] == 1
-    assert kwargs["channels"] == 1
-    assert isinstance(kwargs["extra_settings"], _FakeWasapiSettings)
-    assert kwargs["extra_settings"].loopback is True
+    with pytest.raises(audio_capture.AudioError, match="soundcard loopback"):
+        recorder._make_input_stream(channels=1, blocksize=8000, wasapi_loopback=True)
 
 
-def test_has_loopback_false_without_wasapi(monkeypatch):
-    _patch_sounddevice(
-        monkeypatch,
-        [{"name": "MME", "default_output_device": 0}],
-        [{"name": "Speakers", "hostapi": 0, "max_input_channels": 0, "max_output_channels": 2}],
-    )
+def test_has_loopback_false_without_soundcard(monkeypatch):
+    monkeypatch.setitem(sys.modules, "soundcard", None)
 
     assert audio_capture.has_loopback() is False

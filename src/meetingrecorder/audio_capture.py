@@ -90,6 +90,7 @@ class Recorder:
         self._frames_written: int = 0
         self._writer: Optional[sf.SoundFile] = None
         self._streams: list[sd.Stream] = []
+        self._capture_threads: list[threading.Thread] = []
         self._thread: Optional[threading.Thread] = None
         self._level_max: float = 0.0
 
@@ -143,6 +144,11 @@ class Recorder:
             try:
                 s.stop()
                 s.close()
+            except Exception:
+                pass
+        for t in self._capture_threads:
+            try:
+                t.join(timeout=2.0)
             except Exception:
                 pass
         if self._thread is not None:
@@ -208,13 +214,14 @@ class Recorder:
 
         if self.config.capture_system:
             try:
-                sys_stream = self._make_input_stream(
-                    channels=self.config.channels,
-                    blocksize=blocksize,
-                    wasapi_loopback=True,
+                sys_thread = threading.Thread(
+                    target=self._soundcard_loopback_loop,
+                    args=(blocksize,),
+                    name="meeting-recorder-system-loopback",
+                    daemon=True,
                 )
-                sys_stream.start()
-                self._streams.append(sys_stream)
+                sys_thread.start()
+                self._capture_threads.append(sys_thread)
             except Exception as exc:
                 # Degrade gracefully if loopback isn't available
                 if self.config.capture_mic:
@@ -225,32 +232,35 @@ class Recorder:
                     ) from exc
 
     def _make_input_stream(self, channels: int, blocksize: int, wasapi_loopback: bool) -> sd.Stream:
-        """Create an input stream.
+        """Create the microphone input stream.
 
-        For microphone capture, this is the default input device.
-
-        For Windows speaker/output capture, this must be the **default output
-        device** opened through WASAPI loopback. Opening the default input with
-        ``WasapiSettings(loopback=True)`` is not enough and silently misses the
-        speaker mix on many machines.
+        System/speaker output is captured separately through the ``soundcard``
+        package because Python sounddevice's Windows wheels do not expose a
+        stable WASAPI loopback setting.
         """
+        if wasapi_loopback:
+            raise AudioError("internal error: system audio should use soundcard loopback")
         kwargs = dict(
             samplerate=self.config.sample_rate,
             blocksize=blocksize,
             dtype="float32",
-            callback=self._make_callback("system" if wasapi_loopback else "mic"),
+            callback=self._make_callback("mic"),
+            channels=channels,
         )
-        if wasapi_loopback:
-            device_index, device_info = _default_wasapi_output_device()
-            out_channels = int(device_info.get("max_output_channels", 0) or 0)
-            if out_channels <= 0:
-                raise AudioError("default WASAPI output device has no output channels")
-            kwargs["device"] = device_index
-            kwargs["channels"] = min(max(1, channels), out_channels)
-            kwargs["extra_settings"] = sd.WasapiSettings(loopback=True)
-        else:
-            kwargs["channels"] = channels
         return sd.InputStream(**kwargs)
+
+    def _soundcard_loopback_loop(self, blocksize: int) -> None:
+        """Capture speaker/output audio via SoundCard's WASAPI loopback mic."""
+        try:
+            loopback = _default_soundcard_loopback()
+            # SoundCard's recorder returns float32 frames in [-1, 1]. Keep this
+            # loop chunked so Stop can interrupt within roughly one block.
+            with loopback.recorder(samplerate=self.config.sample_rate, channels=self.config.channels) as rec:
+                while not self._stop.is_set():
+                    chunk = rec.record(numframes=blocksize)
+                    self._q.put(("system", np.asarray(chunk, dtype=np.float32).copy()))
+        except Exception as exc:
+            self._safe_error(AudioError(f"system audio capture unavailable ({exc})"))
 
     def _make_callback(self, source: str):
         def _cb(indata, _frames, _time_info, _status):
@@ -331,6 +341,34 @@ def _default_wasapi_output_device() -> tuple[int, dict]:
     raise AudioError("no WASAPI output/speaker device found for loopback capture")
 
 
+def _default_soundcard_loopback():
+    """Return SoundCard's loopback microphone for the current default speaker.
+
+    ``soundcard`` exposes Windows speaker/output capture as a loopback
+    microphone. Matching by the default speaker name follows the user's active
+    output route (Digital Output, monitor audio, headset, etc.).
+    """
+    try:
+        import soundcard as sc
+    except ImportError as exc:
+        raise AudioError("soundcard package is required for speaker/output capture") from exc
+
+    speaker = sc.default_speaker()
+    if speaker is None:
+        raise AudioError("no default speaker/output device found")
+    try:
+        return sc.get_microphone(speaker.name, include_loopback=True)
+    except Exception as exc:
+        # Fall back to a fuzzy contains match for driver names that differ
+        # slightly between speaker and loopback endpoint labels.
+        speaker_name = str(getattr(speaker, "name", "")).lower()
+        for mic in sc.all_microphones(include_loopback=True):
+            mic_name = str(getattr(mic, "name", "")).lower()
+            if speaker_name and (speaker_name in mic_name or mic_name in speaker_name):
+                return mic
+        raise AudioError(f"no loopback device found for default speaker {speaker!r}") from exc
+
+
 def list_input_devices() -> list[dict]:
     """Return a snapshot of available input devices for the settings dialog."""
     out: list[dict] = []
@@ -348,7 +386,7 @@ def list_input_devices() -> list[dict]:
 def has_loopback() -> bool:
     """Best-effort check: can Windows speaker/output audio be captured?"""
     try:
-        _default_wasapi_output_device()
+        _default_soundcard_loopback()
         return True
     except Exception:
         return False
