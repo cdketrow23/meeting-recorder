@@ -21,7 +21,6 @@ hiddenimports = [
     "soundfile",
     "numpy",
     "vosk",
-    "vosk.__main__",
     "tkinter",
 ]
 
