@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
-from collections import deque
 
 import numpy as np
 import pytest
+import soundfile as sf
 
 from meetingrecorder import audio_capture
 
@@ -112,22 +113,6 @@ def test_has_loopback_false_without_soundcard(monkeypatch):
     assert audio_capture.has_loopback() is False
 
 
-def test_mixes_mic_and_system_chunks_instead_of_appending_alternating_chunks(tmp_path):
-    recorder = audio_capture.Recorder(
-        audio_capture.RecorderConfig(output_path=tmp_path / "x.wav", capture_mic=True, capture_system=True)
-    )
-    mic = np.zeros((4, 1), dtype=np.float32)
-    system = np.full((4, 1), 0.25, dtype=np.float32)
-    buffers = {"mic": deque([mic]), "system": deque([system])}
-
-    mixed = recorder._pop_mixed_chunk(buffers, require_all=True)
-
-    assert mixed.shape == (4, 1)
-    np.testing.assert_allclose(mixed, system)
-    assert not buffers["mic"]
-    assert not buffers["system"]
-
-
 def test_mixing_clips_combined_sources_and_preserves_single_timeline(tmp_path):
     recorder = audio_capture.Recorder(
         audio_capture.RecorderConfig(output_path=tmp_path / "x.wav", capture_mic=True, capture_system=True)
@@ -140,3 +125,34 @@ def test_mixing_clips_combined_sources_and_preserves_single_timeline(tmp_path):
 
     assert mixed.shape == (3, 1)
     np.testing.assert_allclose(mixed, np.ones((3, 1), dtype=np.float32))
+
+
+def test_raw_tracks_are_post_mixed_with_first_chunk_offsets(tmp_path):
+    cfg = audio_capture.RecorderConfig(
+        sample_rate=8000,
+        channels=1,
+        capture_mic=True,
+        capture_system=True,
+        output_path=tmp_path / "final.wav",
+        raw_dir=tmp_path / "raw",
+        metadata_path=tmp_path / "final_metadata.json",
+    )
+    recorder = audio_capture.Recorder(cfg)
+    recorder._started_at = 100.0
+    recorder._prepare_raw_outputs()
+    recorder._write_raw_chunk("mic", np.zeros((8000, 1), dtype=np.float32), captured_at=100.0)
+    recorder._write_raw_chunk("system", np.ones((8000, 1), dtype=np.float32) * 0.5, captured_at=100.00025)
+    recorder._close_raw_outputs()
+
+    recorder._post_mix_raw_tracks()
+    recorder._write_metadata()
+
+    data, sr = sf.read(tmp_path / "final.wav", dtype="float32", always_2d=True)
+    assert sr == 8000
+    assert data.shape == (8002, 1)
+    np.testing.assert_allclose(data[:2], 0.0, atol=1e-4)
+    np.testing.assert_allclose(data[2:8002], 0.5, atol=1e-4)
+    assert (tmp_path / "raw" / "mic.wav").is_file()
+    assert (tmp_path / "raw" / "system.wav").is_file()
+    meta = json.loads((tmp_path / "final_metadata.json").read_text())
+    assert meta["sources"]["system"]["first_chunk_offset_seconds"] == pytest.approx(0.00025)

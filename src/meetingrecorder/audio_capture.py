@@ -1,29 +1,25 @@
-"""Microphone + system-audio capture to a single normalized WAV file.
+"""Microphone + system-audio capture with raw tracks and post-stop mixing.
 
 Capture strategy
 ----------------
 * Microphone: ``sounddevice`` default input stream.
-* System audio: WASAPI loopback via ``sounddevice``. On Windows 10/11 the
-  default output device exposes a loopback input when ``sd.WasapiSettings``
-  is used. On other platforms the system-audio track is reported as
-  unavailable and the recorder happily degrades to mic-only.
+* System audio: ``soundcard`` loopback microphone for the default speaker.
 
-This module is intentionally Windows-friendly but is import-safe on any
-platform. ``Recorder.start`` will raise :class:`AudioError` with a clear
-message if the platform does not support loopback.
-
-The implementation writes a 16-bit PCM mono WAV at the chosen sample rate
-using the ``soundfile`` library, with chunked append so the file is always
-valid even after a forced stop.
+The Record button starts all enabled sources at once. Internally, each enabled
+source is written to its own raw WAV plus timing metadata. When Stop is clicked,
+the recorder pads each raw track by its first-chunk offset and mixes the tracks
+into the final user-facing WAV. Keeping raw tracks makes sync/audio bugs much
+easier to diagnose than live-mixing callbacks directly into the final file.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import queue
+import shutil
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -48,6 +44,9 @@ class RecorderConfig:
     output_path: Path = Path("recording.wav")
     chunk_seconds: float = 0.5
     max_seconds: int = 4 * 60 * 60  # 4 hour hard cap
+    raw_dir: Optional[Path] = None
+    metadata_path: Optional[Path] = None
+    keep_raw: bool = True
 
     def __post_init__(self) -> None:
         if self.sample_rate < 8_000 or self.sample_rate > 48_000:
@@ -61,17 +60,11 @@ class RecorderConfig:
 
 
 class Recorder:
-    """Stateful recorder that writes a single WAV across the whole session.
+    """Stateful recorder that starts all enabled sources together.
 
-    Typical GUI flow::
-
-        rec = Recorder(RecorderConfig(output_path=...))
-        rec.start()           # spawns capture thread, opens WAV
-        ...
-        rec.stop()            # blocks until all chunks flushed + file closed
-
-    ``Recorder`` is **not** safe to share between threads except that
-    ``is_active`` is documented as readable from any thread.
+    ``Recorder`` is not safe to share between threads except that ``is_active``,
+    ``elapsed_seconds``, and ``level_max`` are documented as readable from any
+    thread.
     """
 
     def __init__(
@@ -84,34 +77,34 @@ class Recorder:
         self._on_amplitude = on_amplitude
         self._on_error = on_error
 
-        self._q: "queue.Queue[tuple[str, np.ndarray]]" = queue.Queue()
+        self._q: "queue.Queue[tuple[str, np.ndarray, float]]" = queue.Queue()
         self._stop = threading.Event()
         self._active = threading.Event()
         self._started_at: Optional[float] = None
         self._frames_written: int = 0
-        self._writer: Optional[sf.SoundFile] = None
         self._streams: list[sd.Stream] = []
         self._capture_threads: list[threading.Thread] = []
         self._thread: Optional[threading.Thread] = None
         self._level_max: float = 0.0
+        self._raw_writers: dict[str, sf.SoundFile] = {}
+        self._raw_paths: dict[str, Path] = {}
+        self._source_meta: dict[str, dict] = {}
+        self._metadata: dict = {}
 
     # -------------------- public API --------------------
 
     @property
     def is_active(self) -> bool:
-        """``True`` while capture is in progress (any thread)."""
         return self._active.is_set()
 
     @property
     def elapsed_seconds(self) -> float:
-        """Seconds since :meth:`start` was called, regardless of stop."""
         if self._started_at is None:
             return 0.0
         return max(0.0, time.monotonic() - self._started_at)
 
     @property
     def level_max(self) -> float:
-        """Peak absolute sample value observed so far (0.0 - 1.0)."""
         return self._level_max
 
     def start(self) -> None:
@@ -121,16 +114,17 @@ class Recorder:
             raise AudioError("at least one source must be enabled")
 
         self.config.output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._writer = sf.SoundFile(
-            str(self.config.output_path),
-            mode="w",
-            samplerate=self.config.sample_rate,
-            channels=self.config.channels,
-            subtype="PCM_16",
-        )
+        self._prepare_raw_outputs()
         self._frames_written = 0
         self._level_max = 0.0
         self._started_at = time.monotonic()
+        self._metadata = {
+            "session_start_monotonic": self._started_at,
+            "sample_rate": self.config.sample_rate,
+            "channels": self.config.channels,
+            "final_wav": str(self.config.output_path),
+            "sources": {},
+        }
         self._stop.clear()
         self._active.set()
         self._thread = threading.Thread(target=self._run, name="meeting-recorder", daemon=True)
@@ -140,7 +134,6 @@ class Recorder:
         if not self.is_active:
             return self.config.output_path
         self._stop.set()
-        # Closing streams flushes any pending chunks through the queue
         for s in self._streams:
             try:
                 s.stop()
@@ -157,47 +150,15 @@ class Recorder:
             if self._thread.is_alive():
                 self._safe_error(AudioError("capture thread did not stop cleanly"))
         self._streams.clear()
-        if self._writer is not None:
-            try:
-                self._writer.close()
-            finally:
-                self._writer = None
+        self._close_raw_outputs()
+        self._post_mix_raw_tracks()
+        self._write_metadata()
+        if not self.config.keep_raw:
+            self._cleanup_raw_outputs()
         self._active.clear()
         return self.config.output_path
 
-    # -------------------- internal capture loop --------------------
-
-    def _run(self) -> None:
-        try:
-            self._open_streams()
-            expected_sources = self._expected_sources()
-            source_buffers: dict[str, deque[np.ndarray]] = {source: deque() for source in expected_sources}
-            last_write_at = time.monotonic()
-            while not self._stop.is_set() and self.elapsed_seconds < self.config.max_seconds:
-                try:
-                    source, chunk = self._q.get(timeout=0.2)
-                except queue.Empty:
-                    if source_buffers and time.monotonic() - last_write_at >= self.config.chunk_seconds * 2:
-                        mixed = self._pop_mixed_chunk(source_buffers, require_all=False)
-                        if mixed is not None:
-                            self._write_chunk(mixed)
-                            last_write_at = time.monotonic()
-                    continue
-                if chunk.size == 0:
-                    continue
-                if len(expected_sources) <= 1 or source not in source_buffers:
-                    self._write_chunk(chunk)
-                    last_write_at = time.monotonic()
-                    continue
-                source_buffers[source].append(chunk)
-                while True:
-                    mixed = self._pop_mixed_chunk(source_buffers, require_all=True)
-                    if mixed is None:
-                        break
-                    self._write_chunk(mixed)
-                    last_write_at = time.monotonic()
-        except Exception as exc:
-            self._safe_error(exc)
+    # -------------------- raw track + mix helpers --------------------
 
     def _expected_sources(self) -> tuple[str, ...]:
         sources: list[str] = []
@@ -206,6 +167,122 @@ class Recorder:
         if self.config.capture_system:
             sources.append("system")
         return tuple(sources)
+
+    def _raw_dir(self) -> Path:
+        return Path(self.config.raw_dir) if self.config.raw_dir else self.config.output_path.parent / "raw" / self.config.output_path.stem
+
+    def _metadata_path(self) -> Path:
+        return Path(self.config.metadata_path) if self.config.metadata_path else self.config.output_path.with_name(f"{self.config.output_path.stem}_metadata.json")
+
+    def _prepare_raw_outputs(self) -> None:
+        raw_dir = self._raw_dir()
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        self._raw_writers.clear()
+        self._raw_paths.clear()
+        self._source_meta.clear()
+        for source in self._expected_sources():
+            raw_path = raw_dir / f"{source}.wav"
+            self._raw_paths[source] = raw_path
+            self._source_meta[source] = {
+                "path": str(raw_path),
+                "sample_rate": self.config.sample_rate,
+                "channels": self.config.channels,
+                "first_chunk_monotonic": None,
+                "first_chunk_offset_seconds": None,
+                "frames": 0,
+                "chunks": 0,
+            }
+            self._raw_writers[source] = sf.SoundFile(
+                str(raw_path),
+                mode="w",
+                samplerate=self.config.sample_rate,
+                channels=self.config.channels,
+                subtype="PCM_16",
+            )
+
+    def _close_raw_outputs(self) -> None:
+        for writer in self._raw_writers.values():
+            try:
+                writer.close()
+            except Exception:
+                pass
+        self._raw_writers.clear()
+
+    def _cleanup_raw_outputs(self) -> None:
+        shutil.rmtree(self._raw_dir(), ignore_errors=True)
+
+    def _write_metadata(self) -> None:
+        self._metadata["session_stop_monotonic"] = time.monotonic()
+        self._metadata["duration_seconds"] = self.elapsed_seconds
+        self._metadata["sources"] = self._source_meta
+        path = self._metadata_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self._metadata, indent=2), encoding="utf-8")
+
+    def _post_mix_raw_tracks(self) -> None:
+        tracks: list[tuple[int, np.ndarray]] = []
+        max_frames = 0
+        for source, raw_path in self._raw_paths.items():
+            if not raw_path.is_file() or self._source_meta.get(source, {}).get("frames", 0) <= 0:
+                continue
+            data, sr = sf.read(str(raw_path), dtype="float32", always_2d=True)
+            if sr != self.config.sample_rate:
+                raise AudioError(f"unexpected sample rate for {source}: {sr}")
+            data = self._normalize_chunk(data)
+            offset_s = float(self._source_meta[source].get("first_chunk_offset_seconds") or 0.0)
+            offset_frames = max(0, int(round(offset_s * self.config.sample_rate)))
+            tracks.append((offset_frames, data))
+            max_frames = max(max_frames, offset_frames + data.shape[0])
+
+        if not tracks:
+            # Still create a valid empty-ish WAV instead of leaving no final file.
+            sf.write(str(self.config.output_path), np.zeros((0, self.config.channels), dtype=np.float32), self.config.sample_rate, subtype="PCM_16")
+            self._frames_written = 0
+            return
+
+        mixed = np.zeros((max_frames, self.config.channels), dtype=np.float32)
+        for offset, data in tracks:
+            mixed[offset : offset + data.shape[0], : data.shape[1]] += data
+        mixed = np.clip(mixed, -1.0, 1.0)
+        sf.write(str(self.config.output_path), mixed, self.config.sample_rate, subtype="PCM_16")
+        self._frames_written = mixed.shape[0]
+
+    # -------------------- internal capture loop --------------------
+
+    def _run(self) -> None:
+        try:
+            self._open_streams()
+            while (not self._stop.is_set() or not self._q.empty()) and self.elapsed_seconds < self.config.max_seconds:
+                try:
+                    source, chunk, captured_at = self._q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if chunk.size == 0:
+                    continue
+                self._write_raw_chunk(source, chunk, captured_at)
+        except Exception as exc:
+            self._safe_error(exc)
+
+    def _write_raw_chunk(self, source: str, chunk: np.ndarray, captured_at: float) -> None:
+        writer = self._raw_writers.get(source)
+        if writer is None:
+            return
+        chunk = self._normalize_chunk(chunk)
+        meta = self._source_meta[source]
+        if meta["first_chunk_monotonic"] is None:
+            meta["first_chunk_monotonic"] = captured_at
+            meta["first_chunk_offset_seconds"] = max(0.0, captured_at - (self._started_at or captured_at))
+        peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+        if peak > self._level_max:
+            self._level_max = peak
+        writer.write(chunk)
+        meta["frames"] += int(chunk.shape[0])
+        meta["chunks"] += 1
+        if self._on_amplitude:
+            try:
+                self._on_amplitude(self._level_max)
+            except Exception as exc:
+                self._safe_error(exc)
 
     def _normalize_chunk(self, chunk: np.ndarray) -> np.ndarray:
         chunk = np.asarray(chunk, dtype=np.float32)
@@ -216,17 +293,8 @@ class Recorder:
         if chunk.shape[1] < self.config.channels:
             chunk = np.tile(chunk[:, :1], (1, self.config.channels))
         elif chunk.shape[1] != self.config.channels:
-            # last-ditch: take the first configured channels
             chunk = chunk[:, : self.config.channels]
-        return chunk
-
-    def _pop_mixed_chunk(self, source_buffers: dict[str, deque[np.ndarray]], require_all: bool) -> np.ndarray | None:
-        if require_all and not all(source_buffers[source] for source in source_buffers):
-            return None
-        chunks = [source_buffers[source].popleft() for source in source_buffers if source_buffers[source]]
-        if not chunks:
-            return None
-        return self._mix_chunks(chunks)
+        return np.clip(chunk, -1.0, 1.0)
 
     def _mix_chunks(self, chunks: Iterable[np.ndarray]) -> np.ndarray:
         normalized = [self._normalize_chunk(chunk) for chunk in chunks if chunk.size]
@@ -237,20 +305,6 @@ class Recorder:
         for chunk in normalized:
             mixed[: chunk.shape[0], : chunk.shape[1]] += chunk
         return np.clip(mixed, -1.0, 1.0)
-
-    def _write_chunk(self, chunk: np.ndarray) -> None:
-        chunk = self._normalize_chunk(chunk)
-        peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
-        if peak > self._level_max:
-            self._level_max = peak
-        if self._writer is not None:
-            self._writer.write(chunk)
-            self._frames_written += chunk.shape[0]
-        if self._on_amplitude:
-            try:
-                self._on_amplitude(self._level_max)
-            except Exception as exc:
-                self._safe_error(exc)
 
     def _open_streams(self) -> None:
         blocksize = max(1, int(self.config.chunk_seconds * self.config.sample_rate))
@@ -278,21 +332,12 @@ class Recorder:
                 sys_thread.start()
                 self._capture_threads.append(sys_thread)
             except Exception as exc:
-                # Degrade gracefully if loopback isn't available
                 if self.config.capture_mic:
                     self._safe_warning(f"system audio capture unavailable ({exc}); mic-only")
                 else:
-                    raise AudioError(
-                        "system audio capture unavailable and mic is off"
-                    ) from exc
+                    raise AudioError("system audio capture unavailable and mic is off") from exc
 
     def _make_input_stream(self, channels: int, blocksize: int, wasapi_loopback: bool) -> sd.Stream:
-        """Create the microphone input stream.
-
-        System/speaker output is captured separately through the ``soundcard``
-        package because Python sounddevice's Windows wheels do not expose a
-        stable WASAPI loopback setting.
-        """
         if wasapi_loopback:
             raise AudioError("internal error: system audio should use soundcard loopback")
         kwargs = dict(
@@ -305,15 +350,13 @@ class Recorder:
         return sd.InputStream(**kwargs)
 
     def _soundcard_loopback_loop(self, blocksize: int) -> None:
-        """Capture speaker/output audio via SoundCard's WASAPI loopback mic."""
         try:
             loopback = _default_soundcard_loopback()
-            # SoundCard's recorder returns float32 frames in [-1, 1]. Keep this
-            # loop chunked so Stop can interrupt within roughly one block.
             with loopback.recorder(samplerate=self.config.sample_rate, channels=self.config.channels) as rec:
                 while not self._stop.is_set():
+                    captured_at = time.monotonic()
                     chunk = rec.record(numframes=blocksize)
-                    self._q.put(("system", np.asarray(chunk, dtype=np.float32).copy()))
+                    self._q.put(("system", np.asarray(chunk, dtype=np.float32).copy(), captured_at))
         except Exception as exc:
             self._safe_error(AudioError(f"system audio capture unavailable ({exc})"))
 
@@ -321,11 +364,11 @@ class Recorder:
         def _cb(indata, _frames, _time_info, _status):
             if _status:
                 self._safe_warning(f"[{source}] {_status}")
-            self._q.put((source, np.asarray(indata, dtype=np.float32).copy()))
+            captured_at = time.monotonic()
+            self._q.put((source, np.asarray(indata, dtype=np.float32).copy(), captured_at))
         return _cb
 
     def _safe_warning(self, msg: str) -> None:
-        # Soft warnings are not fatal; route them through on_error if it exists
         if self._on_error:
             try:
                 self._on_error(AudioError(msg))
@@ -370,12 +413,7 @@ def _wasapi_hostapi_index() -> int | None:
 
 
 def _default_wasapi_output_device() -> tuple[int, dict]:
-    """Return ``(device_index, device_info)`` for the default WASAPI speaker.
-
-    Windows speaker capture is implemented by opening the *output* device with
-    WASAPI loopback enabled. Prefer the WASAPI host API's own default output;
-    fall back to any output device on the WASAPI host API.
-    """
+    """Return ``(device_index, device_info)`` for the default WASAPI speaker."""
     api_index = _wasapi_hostapi_index()
     if api_index is None:
         raise AudioError("WASAPI host API is not available on this machine")
@@ -397,12 +435,7 @@ def _default_wasapi_output_device() -> tuple[int, dict]:
 
 
 def _default_soundcard_loopback():
-    """Return SoundCard's loopback microphone for the current default speaker.
-
-    ``soundcard`` exposes Windows speaker/output capture as a loopback
-    microphone. Matching by the default speaker name follows the user's active
-    output route (Digital Output, monitor audio, headset, etc.).
-    """
+    """Return SoundCard's loopback microphone for the current default speaker."""
     try:
         import soundcard as sc
     except ImportError as exc:
@@ -414,8 +447,6 @@ def _default_soundcard_loopback():
     try:
         return sc.get_microphone(speaker.name, include_loopback=True)
     except Exception as exc:
-        # Fall back to a fuzzy contains match for driver names that differ
-        # slightly between speaker and loopback endpoint labels.
         speaker_name = str(getattr(speaker, "name", "")).lower()
         for mic in sc.all_microphones(include_loopback=True):
             mic_name = str(getattr(mic, "name", "")).lower()

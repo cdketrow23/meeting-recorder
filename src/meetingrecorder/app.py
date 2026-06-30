@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 import tkinter as tk
 import traceback
@@ -50,6 +51,7 @@ _DEFAULT_CFG = {
     "channels": 1,
     "capture_mic": True,
     "capture_system": True,
+    "meeting_name": "Meeting",
     "transcription_backend": "auto",
     "language": "en",
     "version": __version__,
@@ -110,6 +112,7 @@ class App:
     def _build_vars(self) -> None:
         self.var_status = tk.StringVar(value="Idle")
         self.var_output = tk.StringVar(value=self.cfg.get("output_dir") or "")
+        self.var_meeting_name = tk.StringVar(value=self.cfg.get("meeting_name") or "Meeting")
         self.var_elapsed = tk.StringVar(value="00:00:00")
         self.var_level = tk.DoubleVar(value=0.0)
         self.var_capture_mic = tk.BooleanVar(value=bool(self.cfg.get("capture_mic", True)))
@@ -156,6 +159,16 @@ class App:
             side="left", fill="x", expand=True, padx=(8, 4), pady=6
         )
         ttk.Button(out_frame, text="Choose...", command=self._choose_output).pack(
+            side="left", padx=(0, 8), pady=6
+        )
+
+        # Meeting/file name row
+        name_frame = ttk.LabelFrame(root, text="Meeting name")
+        name_frame.pack(fill="x", **pad)
+        ttk.Entry(name_frame, textvariable=self.var_meeting_name).pack(
+            side="left", fill="x", expand=True, padx=8, pady=6
+        )
+        ttk.Label(name_frame, text="Adds date + 24h start time, e.g. 2026-06-30_2142").pack(
             side="left", padx=(0, 8), pady=6
         )
 
@@ -311,6 +324,7 @@ class App:
             "output_dir": str(out_dir),
             "capture_mic": bool(self.var_capture_mic.get()),
             "capture_system": bool(self.var_capture_system.get()) and has_loopback(),
+            "meeting_name": self.var_meeting_name.get(),
             "transcription_backend": self.var_backend.get(),
             "language": self.var_language.get(),
             "system_available": has_loopback(),
@@ -323,7 +337,7 @@ class App:
             messagebox.showerror(APP_NAME, "Enable at least one source.")
             return
 
-        basename = session_basename(prefix="meeting")
+        basename = session_basename(prefix=self.var_meeting_name.get() or "Meeting")
         paths = session_paths(out_dir, basename)
         self._current_paths = paths
 
@@ -343,6 +357,9 @@ class App:
                     capture_mic=capture_mic,
                     capture_system=capture_system,
                     output_path=paths["wav"],
+                    raw_dir=paths["raw_dir"],
+                    metadata_path=paths["metadata"],
+                    keep_raw=True,
                 ),
                 on_amplitude=_on_amp,
                 on_error=_on_error,

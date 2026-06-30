@@ -1,9 +1,10 @@
 """Filename and path helpers — pure functions, fully unit-testable on any OS.
 
-The audio capture layer writes a single WAV under
-``<output_dir>/<basename>.wav`` where basename is like ``meeting_2026-06-29_09-14-22``.
-After recording stops, the transcription step produces a transcript file with
-the same stem plus ``.transcript.{txt,md,srt}``.
+The app creates a Windows-safe final WAV under ``<output_dir>/<basename>.wav``.
+For named meetings, basenames look like ``Weekly_Sync_2026-06-30_2142``:
+user-provided meeting name + system date + 24-hour HHMM start time.
+Transcripts use the exact same base name plus ``_transcript`` before the
+extension.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ _RESERVED_WIN_NAMES = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+_WHITESPACE = re.compile(r"\s+")
+_UNDERSCORES = re.compile(r"_+")
 
 
 def utc_timestamp(now: _dt.datetime | None = None) -> str:
@@ -26,56 +29,55 @@ def utc_timestamp(now: _dt.datetime | None = None) -> str:
     return n.strftime("%Y-%m-%dT%H-%M-%SZ")
 
 
+def local_date_hhmm(now: _dt.datetime | None = None) -> str:
+    """Return local/system ``YYYY-MM-DD_HHMM`` with no seconds."""
+    n = (now or _dt.datetime.now()).replace(second=0, microsecond=0)
+    return n.strftime("%Y-%m-%d_%H%M")
+
+
 def sanitize_filename(name: str) -> str:
     """Replace filesystem-hostile characters with ``_`` and trim trailing dots/spaces.
 
     Empty strings and Windows reserved names are mapped to a safe fallback.
     The result is suitable for any modern OS filesystem.
     """
-    cleaned = _INVALID_FS_CHARS.sub("_", name).strip().strip(".")
+    cleaned = _INVALID_FS_CHARS.sub("_", name)
+    cleaned = _WHITESPACE.sub("_", cleaned).strip().strip(".")
+    cleaned = _UNDERSCORES.sub("_", cleaned).strip("_")
     if not cleaned:
         cleaned = "recording"
     if cleaned.upper().split(".")[0] in _RESERVED_WIN_NAMES:
         cleaned = f"_{cleaned}"
-    return cleaned[:120]  # keep paths sane on every platform
+    return cleaned[:120]
 
 
 def default_output_dir(user_home: Path | None = None) -> Path:
-    """``Downloads/MeetingRecorder`` if it exists or can be created, else ``~``.
-
-    Lookup order:
-        1. ``$USERPROFILE/Downloads/MeetingRecorder`` (Windows)
-        2. ``~/Downloads/MeetingRecorder`` (macOS, Linux fallback)
-        3. ``~`` as last resort
-    """
+    """``Downloads/MeetingRecorder`` if it exists or can be created, else ``~``."""
     home = Path(user_home) if user_home is not None else Path.home()
     candidates = [
         Path.home() / "Downloads" / "MeetingRecorder",
         home / "Downloads" / "MeetingRecorder",
         home,
     ]
-    # De-dup while preserving order
     seen: set[Path] = set()
     deduped = [c for c in candidates if not (c in seen or seen.add(c))]
     for c in deduped:
         try:
             c.mkdir(parents=True, exist_ok=True)
-            # Probe writability with a tiny throwaway file
             probe = c / ".mr_writeprobe"
             probe.write_text("ok")
             probe.unlink()
             return c.resolve()
         except OSError:
             continue
-    # Last-ditch: tempdir
     import tempfile
 
     return Path(tempfile.gettempdir()).resolve()
 
 
 def session_basename(prefix: str = "meeting", now: _dt.datetime | None = None) -> str:
-    """Produce a unique sortable stem like ``meeting_2026-06-29_09-14-22``."""
-    return sanitize_filename(f"{prefix}_{utc_timestamp(now)}")
+    """Produce ``<safe name>_YYYY-MM-DD_HHMM`` using local/system time."""
+    return sanitize_filename(f"{prefix}_{local_date_hhmm(now)}")
 
 
 def session_paths(output_dir: Path, basename: str) -> dict[str, Path]:
@@ -83,8 +85,10 @@ def session_paths(output_dir: Path, basename: str) -> dict[str, Path]:
     output_dir = Path(output_dir)
     return {
         "wav": output_dir / f"{basename}.wav",
-        "transcript_txt": output_dir / f"{basename}.transcript.txt",
-        "transcript_md": output_dir / f"{basename}.transcript.md",
-        "transcript_srt": output_dir / f"{basename}.transcript.srt",
-        "metadata": output_dir / f"{basename}.metadata.json",
+        "transcript_txt": output_dir / f"{basename}_transcript.txt",
+        "transcript_md": output_dir / f"{basename}_transcript.md",
+        "transcript_srt": output_dir / f"{basename}_transcript.srt",
+        "transcript_json": output_dir / f"{basename}_transcript.json",
+        "metadata": output_dir / f"{basename}_metadata.json",
+        "raw_dir": output_dir / "raw" / basename,
     }

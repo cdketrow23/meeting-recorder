@@ -115,11 +115,12 @@ def write_transcript(transcript: Transcript, paths: dict[str, Path]) -> dict[str
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
         written[key] = p
-    if "metadata" in paths:
-        mp = Path(paths["metadata"])
+    json_key = "transcript_json" if "transcript_json" in paths else "metadata"
+    if json_key in paths:
+        mp = Path(paths[json_key])
         mp.parent.mkdir(parents=True, exist_ok=True)
         mp.write_text(json.dumps(transcript.to_dict(), indent=2), encoding="utf-8")
-        written["metadata"] = mp
+        written[json_key] = mp
     return written
 
 
