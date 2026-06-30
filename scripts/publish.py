@@ -201,12 +201,20 @@ class GitHub:
 
         res = run_git("push", "-u", "origin", "main", "--force-with-lease", check=False)
         ok = res.returncode == 0
-        msg = (res.stderr or res.stdout or "").strip().splitlines()[-1] if not ok else ""
+        full_log = ((res.stderr or "") + "\n" + (res.stdout or "")).strip()
+        # Keep the last few lines so the reason is visible; fall back to "" if all blank
+        err_msg = ""
+        if not ok:
+            nonblank = [ln for ln in full_log.splitlines() if ln.strip()]
+            err_msg = nonblank[-1] if nonblank else "push failed"
+            err_msg_full = "\n".join(nonblank[-6:])  # last 6 lines for diagnostics
+        else:
+            err_msg_full = ""
         # Always restore the local tree state
         if exclude_paths:
             run_git("checkout", "-q", "main", check=False)
         run_git("remote", "remove", "origin", check=False)
-        return ok, msg, excluded_summary
+        return ok, err_msg, err_msg_full, excluded_summary
 
 
 def main():
@@ -262,7 +270,7 @@ def main():
                     log("Created https://github.com/" + slug)
             else:
                 log("Repo " + slug + " already exists; pushing.")
-            ok, err_msg, excluded_summary = gh.push(slug)
+            ok, err_msg, err_msg_full, excluded_summary = gh.push(slug)
             workflow_stripped = excluded_summary if excluded_summary else ""
             if ok:
                 pushed = True
@@ -271,13 +279,18 @@ def main():
                     warn("Note: " + workflow_stripped)
                     warn("The .github/workflows/*.yml files require a token with the 'workflow' scope. They are in the local commit and the tarball, but NOT on the remote until the scope is added.")
             else:
-                emsg = err_msg.lower()
+                # Use the full multi-line message for matching the workflow-scope rejection
+                emsg = (err_msg_full or err_msg).lower()
                 if "rate limit" in emsg or "secondary rate" in emsg:
                     reason_fallback = "rate limit"
-                elif "workflow" in emsg and "personal access token" in emsg:
+                    warn("Push failed: " + err_msg + " (full: " + err_msg_full + ")")
+                elif "workflow" in emsg and ("personal access token" in emsg or "workflow scope" in emsg or "refusing" in emsg):
                     # Token lacks the `workflow` scope. Try again with the offending paths held back.
                     warn("GitHub rejected because the token lacks the 'workflow' scope. Retrying without .github/workflows/*.")
-                    ok2, err_msg2, excluded_summary2 = gh.push(slug, exclude_paths=[".github/workflows/build-windows.yml", ".github/workflows/lint.yml"])
+                    warn("Original rejection:")
+                    for ln in (err_msg_full or "").splitlines():
+                        warn("  " + ln)
+                    ok2, err_msg2, err_msg_full2, excluded_summary2 = gh.push(slug, exclude_paths=[".github/workflows/build-windows.yml", ".github/workflows/lint.yml"])
                     if ok2:
                         pushed = True
                         reason_fallback = "workflows stripped (token missing 'workflow' scope)"
@@ -289,7 +302,7 @@ def main():
                         warn("Retry failed: " + err_msg2)
                 else:
                     reason_fallback = "push failed: " + err_msg
-                    warn("Push failed: " + err_msg + ". Falling back.")
+                    warn("Push failed: " + err_msg + " (full: " + err_msg_full + ")")
 
     for m in NAS_MIRRORS:
         try:
